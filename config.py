@@ -35,6 +35,11 @@ class DataConfig:
     augment_prob: float = 0.5
     spec: SpecConfig = SpecConfig()
 
+    curriculum_enabled: bool = True
+    curriculum_start_epoch: int = 0
+    curriculum_ramp_epochs: int = 30  # gradual increase difficulty
+    complexity_metric: str = "num_events"  # or "overlap_ratio", etc.
+
 @dataclass
 class YOHOConfig:
     model: ModelConfig = ModelConfig()
