@@ -11,7 +11,7 @@ class YOHO(nn.Module):
         self.spec_transform = T.MelSpectrogram(
             sample_rate=16000, n_mels=cfg.n_mels, hop_length=cfg.hop_length, f_max=cfg.f_max, normalized=cfg.normalized
         )
-        self.backbone = MultiScaleBackbone()
+        self.backbone = BiPathBackbone(base_channels=32)
         in_ch = 128  # From backbone fpn
         self.det_head = DetectionHead(in_ch, cfg.num_classes)
         self.seg_head = SegmentationHead(in_ch, cfg.num_classes) if cfg.seg_enabled else None
