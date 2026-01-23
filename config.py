@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from typing import List, Optional
+import torch
 
 @dataclass
 class SpecConfig:
+    sample_rate: int = 44100
     n_mels: int = 128
     hop_length: int = 512
+    n_fft: int = 1024
     f_max: int = 8000
     normalized: bool = True
 
@@ -17,6 +20,9 @@ class ModelConfig:
     memory_slots: int = 256
     use_memory: bool = True
     seg_enabled: bool = True
+    reg_max: int = 16
+    base_channels: int = 32
+    scales: List[int] = [8, 16, 32]
 
 @dataclass
 class TrainConfig:

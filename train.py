@@ -32,7 +32,8 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch, config):
         labels = {k: v.to(device) for k, v in labels.items()}
         
         with autocast():
-            loss = model(audio, labels)  # assumes model returns loss in train mode
+            loss_dict = model(audio, labels)
+            loss = sum(loss_dict.values())
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
