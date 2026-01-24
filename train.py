@@ -10,8 +10,8 @@ import numpy as np
 from config import YOHOConfig
 from model.yoho import YOHO
 from data.audio_dataset import AudioSEDDataset
-from utils.metrics import event_based_f1, psds
-from utils.visualize import plot_spectrogram_with_preds
+from data.desed_dataset import DESEDDataset
+from utils.metrics import event_based_f1, proper_psds
 
 def get_sample_weights(dataset):
     """Compute difficulty weights: higher for more complex samples"""
@@ -23,13 +23,20 @@ def get_sample_weights(dataset):
         weights.append(overlap_estimate)
     return weights
 
+def get_dataset(config):
+    if config.data.dataset == 'esc50':
+        return AudioSEDDataset(config.data.root_dir, augment_prob=config.data.augment_prob)
+    elif config.data.dataset == 'desed':
+        return DESEDDataset(config.data.root_dir, mode='weak', augment_prob=config.data.augment_prob)
+    else:
+        raise ValueError(f"Unknown dataset: {config.data.dataset}")
 
 def train_epoch(model, loader, optimizer, scaler, device, epoch, config):
     model.train()
     total_loss = 0.0
     for audio, labels in tqdm(loader, desc=f"Epoch {epoch}"):
         audio = audio.to(device)
-        labels = {k: v.to(device) for k, v in labels.items()}
+        labels = {k: [v.to(device) for v in labels[k]] for k in labels[0]}
         
         with autocast():
             loss_dict = model(audio, labels)
@@ -46,19 +53,21 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch, config):
     
     return total_loss / len(loader)
 
-
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, config):
     model.eval()
-    f1_sum, psds_sum, count = 0.0, 0.0, 0
+    all_preds = []
+    all_gts = []
     with torch.no_grad():
         for audio, labels in loader:
             audio = audio.to(device)
             preds = model.infer(audio)
-            f1_sum += event_based_f1(preds, labels)
-            psds_sum += psds(preds, labels)
-            count += 1
-    return {"f1": f1_sum / count, "psds": psds_sum / count}
-
+            all_preds.append(preds)
+            all_gts.append(labels)
+    
+    f1 = np.mean([event_based_f1(p, g) for p, g in zip(all_preds, all_gts)])
+    psds = proper_psds(all_preds, all_gts)  # aggregate lists
+    
+    return {"f1": f1, "psds": psds['psds_scenario1']}
 
 def main(args):
     config = YOHOConfig()
@@ -69,7 +78,7 @@ def main(args):
     wandb.init(project="yoho-audio", config=config.__dict__)
     device = config.train.device
     
-    dataset = AudioSEDDataset(config.data.root_dir, augment_prob=config.data.augment_prob)
+    dataset = get_dataset(config)
 
     if config.data.curriculum_enabled:
         weights = get_sample_weights(dataset)

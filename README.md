@@ -1,6 +1,11 @@
 # YOHO: You Only Hear Once  
 **Real-time Audio Event Detection and Instance Segmentation on Spectrograms**
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 YOHO is a modern, one-stage architecture for polyphonic **Sound Event Detection (SED)** and **temporal-frequency instance segmentation**, heavily inspired by YOLOv8 but specifically re-designed for audio domain challenges.
 
 ## Key Features
@@ -42,6 +47,9 @@ matplotlib>=3.8.0
 numpy>=1.26.0
 wandb>=0.16.0
 tqdm>=4.66.0
+psds-eval>=0.2.0
+sed-eval>=0.2.1  # optional for base metrics
+pandas>=2.0.0
 ```
 
 ## Training example

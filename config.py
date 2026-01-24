@@ -36,7 +36,7 @@ class TrainConfig:
 
 @dataclass
 class DataConfig:
-    dataset: str = "esc50"  # or "urban8k", "audioset"
+    dataset: str = "esc50"  # or "desed"
     root_dir: str = "./data"
     augment_prob: float = 0.5
     spec: SpecConfig = SpecConfig()
