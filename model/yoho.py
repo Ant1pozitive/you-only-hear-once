@@ -2,16 +2,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.transforms as T
-import torchvision.ops as ops  # for NMS
+import torchvision.ops as ops
 from typing import List, Dict, Tuple
+
 from .backbone import BiPathBackbone
-from .heads import AnchorFreeDetectionHead, SegmentationHead, decode_boxes, task_aligned_assigner, VarifocalLoss, CIoULoss
+from .heads import (
+    AnchorFreeDetectionHead, 
+    SegmentationHead, 
+    decode_boxes, 
+    task_aligned_assigner, 
+    VarifocalLoss, 
+    AudioIoULoss
+)
 from .memory_aug import AudioMemoryBank
 
 class YOHO(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.num_classes = cfg.model.num_classes
         
         # Spectrogram transformation
         self.spec_transform = T.MelSpectrogram(
@@ -34,18 +43,18 @@ class YOHO(nn.Module):
         # Detection head
         self.det_head = AnchorFreeDetectionHead(
             in_channels=in_ch,
-            num_classes=cfg.model.num_classes,
+            num_classes=self.num_classes,
             reg_max=cfg.model.reg_max
         )
         
         # Segmentation head
         self.seg_head = SegmentationHead(
             in_channels=in_ch,
-            num_classes=cfg.model.num_classes,
+            num_classes=self.num_classes,
             proto_channels=32
         ) if cfg.model.seg_enabled else None
         
-        # Memory (optional)
+        # Memory
         self.memory = AudioMemoryBank(
             num_slots=cfg.model.memory_slots,
             slot_dim=in_ch
@@ -56,7 +65,7 @@ class YOHO(nn.Module):
         
         # Loss components
         self.vfl = VarifocalLoss()
-        self.ciou = CIoULoss()
+        self.iou_loss = AudioIoULoss(time_weight=2.0, freq_weight=0.5)
         
         # Detection thresholds
         self.conf_thres = 0.25
@@ -80,66 +89,105 @@ class YOHO(nn.Module):
         preds = {"cls": cls_scores, "reg": reg_preds, "seg": seg_out}
         
         if self.training and targets is not None:
-            loss_dict = self.compute_loss(preds, targets)
+            loss_dict = self.compute_loss(preds, targets, spec.shape)
             return loss_dict
         
         return preds
 
-    def compute_loss(self, preds: Dict, targets: Dict) -> Dict:
+    def compute_loss(self, preds: Dict, targets: Dict, spec_shape: Tuple[int, int, int, int]) -> Dict:
         """
-        Compute full loss with task-aligned assignment
-        targets: {'boxes': [B, N_gt, 4], 'cls': [B, N_gt], 'masks': [B, N_gt, H, W] optional}
+        Compute full loss with batched task-aligned assignment
+        targets: {'boxes': List of [N_gt, 4], 'cls': List of [N_gt], 'masks': Optional List}
+        spec_shape: [B, 1, n_mels, time]
         """
-        cls_scores = preds['cls']
-        reg_preds = preds['reg']
-        seg_out = preds.get('seg', None)
+        device = preds['cls'][0].device
+        B = spec_shape[0]
+        feat_shape = (spec_shape[2], spec_shape[3])  # (n_mels, time)
         
-        loss_cls = 0.0
-        loss_box = 0.0
-        loss_seg = 0.0
-        num_pos = 0
+        all_pred_scores = []
+        all_pred_boxes = []
         
-        for i in range(len(cls_scores)):
-            cls = cls_scores[i].permute(0, 2, 3, 1).reshape(1, -1, self.num_classes)  # [1, A, C]
-            reg = reg_preds[i].permute(0, 2, 3, 1).reshape(1, -1, 4 * (self.cfg.model.reg_max + 1))  # [1, A, 4*(reg_max+1)]
+        # 1. Decode predictions from all FPN levels and concatenate
+        for i in range(len(preds['cls'])):
+            cls = preds['cls'][i]  # [B, C, H, W]
+            reg = preds['reg'][i]  # [B, 4*(reg_max+1), H, W]
             
-            # Decode boxes
-            pred_boxes = decode_boxes(reg[0], self.strides[i], self.cfg.spec.n_mels, reg.shape[-1])
+            # [B, H*W, C]
+            scores = cls.permute(0, 2, 3, 1).reshape(B, -1, self.num_classes).sigmoid()
+            # [B, H*W, 4]
+            boxes = decode_boxes(reg, self.strides[i], feat_shape)
             
-            # Per-batch - assume B=1 for simplicity; extend for larger B
-            gt_boxes = targets['boxes'][0]
-            gt_labels = targets['cls'][0]
+            all_pred_scores.append(scores)
+            all_pred_boxes.append(boxes)
             
-            if len(gt_boxes) == 0:
-                continue
-            
-            # Assignment
-            pred_scores = cls[0].sigmoid()
-            assigned_ids, assigned_scores, pos_mask = task_aligned_assigner(
-                pred_boxes, pred_scores, gt_boxes, gt_labels
-            )
-            
-            num_pos += pos_mask.sum()
-            
-            # CLS loss
-            pos_labels = gt_labels[assigned_ids[pos_mask]]
-            loss_cls += self.vfl(
-                pred_scores[pos_mask], assigned_scores, pos_labels
-            )
-            
-            # Box loss
+        pred_scores = torch.cat(all_pred_scores, dim=1)  # [B, Total_A, C]
+        pred_boxes = torch.cat(all_pred_boxes, dim=1)    # [B, Total_A, 4]
+        
+        # 2. Pad Ground Truths for batched processing
+        max_gt = max([len(b) for b in targets['boxes']]) if len(targets['boxes']) > 0 else 0
+        max_gt = max(1, max_gt)  # Ensure at least size 1 to avoid tensor dimension errors
+        
+        gt_boxes = torch.zeros((B, max_gt, 4), device=device)
+        gt_labels = torch.zeros((B, max_gt), dtype=torch.long, device=device)
+        mask_gt = torch.zeros((B, max_gt), dtype=torch.bool, device=device)
+        
+        for b in range(B):
+            n_gt = len(targets['boxes'][b])
+            if n_gt > 0:
+                gt_boxes[b, :n_gt] = targets['boxes'][b]
+                gt_labels[b, :n_gt] = targets['cls'][b]
+                mask_gt[b, :n_gt] = True
+                
+        # 3. Batched Task-Aligned Assignment
+        assigned_ids, assigned_scores, pos_mask = task_aligned_assigner(
+            pred_boxes, pred_scores, gt_boxes, gt_labels, mask_gt, self.iou_thres
+        )
+        
+        # 4. Compute Classification Loss (Varifocal Loss)
+        target_scores = torch.zeros_like(pred_scores)
+        target_labels = torch.full_like(pred_scores, -1)
+        
+        for b in range(B):
+            pm = pos_mask[b]
+            if pm.sum() > 0:
+                ids = assigned_ids[b][pm]
+                classes = gt_labels[b, ids]
+                target_labels[b, pm, classes] = 1
+                target_scores[b, pm, classes] = assigned_scores[b, pm]
+                
+        loss_cls = self.vfl(pred_scores, target_scores, target_labels)
+        
+        # 5. Compute Box Regression Loss (Asymmetric Audio IoU)
+        loss_box = torch.tensor(0.0, device=device)
+        num_pos = pos_mask.sum()
+        
+        if num_pos > 0:
             pos_pred_boxes = pred_boxes[pos_mask]
-            pos_gt_boxes = gt_boxes[assigned_ids[pos_mask]]
-            loss_box += self.ciou(pos_pred_boxes, pos_gt_boxes)
-        
-        # Seg loss (simple BCE)
-        if seg_out is not None and 'masks' in targets:
-            proto, coeffs = seg_out
-            gt_masks = targets['masks'][0]  # [N_gt, H, W]
-            pred_masks = (proto.unsqueeze(0) * coeffs.unsqueeze(2).unsqueeze(3)).sum(1).sigmoid()  # approx
-            loss_seg = F.binary_cross_entropy(pred_masks, gt_masks)
-        
-        total_loss = loss_cls + 5.0 * loss_box + 2.0 * loss_seg  # weighted
+            pos_gt_boxes = torch.zeros_like(pos_pred_boxes)
+            
+            idx = 0
+            for b in range(B):
+                pm = pos_mask[b]
+                n_p = pm.sum()
+                if n_p > 0:
+                    pos_gt_boxes[idx:idx+n_p] = gt_boxes[b, assigned_ids[b, pm]]
+                    idx += n_p
+                    
+            loss_box = self.iou_loss(pos_pred_boxes, pos_gt_boxes)
+            
+        # 6. Compute Segmentation Loss (Optional fallback)
+        loss_seg = torch.tensor(0.0, device=device)
+        if preds.get('seg') is not None and 'masks' in targets:
+            proto, coeffs = preds['seg']
+            # Highly simplified placeholder for segmentation integration
+            pred_masks = (proto.mean(dim=1) * coeffs.mean(dim=1)).sigmoid()
+            gt_masks = torch.stack(targets['masks']).to(device) if len(targets['masks']) > 0 else None
+            if gt_masks is not None:
+                # Resize pred_masks to match gt_masks if necessary
+                pred_masks = F.interpolate(pred_masks.unsqueeze(1), size=gt_masks.shape[-2:]).squeeze(1)
+                loss_seg = F.binary_cross_entropy(pred_masks, gt_masks.float())
+                
+        total_loss = loss_cls + 5.0 * loss_box + 2.0 * loss_seg
         
         return {
             "loss_cls": loss_cls,
@@ -155,6 +203,7 @@ class YOHO(nn.Module):
         Standard single-pass inference with NMS
         """
         spec = self.spec_transform(audio).unsqueeze(1)
+        feat_shape = (spec.shape[2], spec.shape[3])
         feats = self.backbone(spec)
         cls_scores, reg_preds = self.det_head(feats)
         
@@ -164,10 +213,11 @@ class YOHO(nn.Module):
         
         for i in range(len(cls_scores)):
             cls = cls_scores[i].sigmoid().permute(0, 2, 3, 1).reshape(-1, self.num_classes)
-            reg = reg_preds[i].permute(0, 2, 3, 1).reshape(-1, 4 * (self.cfg.model.reg_max + 1))
+            reg = reg_preds[i]
             
             scores, labels = cls.max(dim=1)
-            boxes = decode_boxes(reg.unsqueeze(0), self.strides[i], spec.shape[2:])[0]
+            # Reg requires 4D input for decode_boxes [bs, 4*(reg_max+1), h, w]
+            boxes = decode_boxes(reg, self.strides[i], feat_shape)[0]  # Take first batch
             
             mask = scores > conf_thres
             boxes = boxes[mask]
@@ -205,14 +255,6 @@ class YOHO(nn.Module):
                      iou_thres: float = 0.45) -> Dict:
         """
         Streaming inference mode - process audio in overlapping chunks and merge predictions
-        
-        Args:
-            audio_stream: long audio tensor [T]
-            chunk_length_sec: length of each processing chunk
-            overlap_sec: overlap between consecutive chunks
-            
-        Returns:
-            Merged predictions dict
         """
         sr = self.cfg.spec.sample_rate
         chunk_samples = int(chunk_length_sec * sr)
@@ -225,7 +267,6 @@ class YOHO(nn.Module):
         all_labels = []
         
         start = 0
-        chunk_id = 0
         while start < total_samples:
             end = min(start + chunk_samples, total_samples)
             chunk = audio_stream[start:end]
@@ -241,11 +282,11 @@ class YOHO(nn.Module):
             pred = self.infer(chunk, conf_thres=conf_thres, iou_thres=iou_thres)
             
             if len(pred["boxes"]) > 0:
-                # Adjust time to global
+                # Adjust time to global (Offset the time axis, which are idx 0 and 2)
                 offset = start / sr
                 pred["boxes"][:, [0, 2]] += offset
                 
-                # Adjust for padding
+                # Filter out predictions that fall into the padding area
                 pad_time = pad_len / sr
                 mask = pred["boxes"][:, 2] <= chunk_length_sec - pad_time
                 for k in pred:
@@ -256,7 +297,6 @@ class YOHO(nn.Module):
                 all_labels.append(pred["labels"])
             
             start += step
-            chunk_id += 1
         
         if len(all_boxes) == 0:
             return {"boxes": torch.empty((0,4)), "scores": torch.empty(0), "labels": torch.empty(0, dtype=torch.long)}
@@ -269,7 +309,7 @@ class YOHO(nn.Module):
         # Cross-chunk NMS
         keep = ops.nms(boxes, scores, iou_thres)
         
-        # Sort by time
+        # Sort chronologically by the start time (x1)
         sort_idx = boxes[keep, 0].argsort()
         
         return {
