@@ -40,12 +40,12 @@ class BiPathBlock(nn.Module):
         super().__init__()
         # Temporal path (focus on time axis)
         self.temp_conv = nn.Sequential(
-            Conv(channels, channels, k=(1, 5), p=(0, 2)),  # Wide in time, narrow in freq
+            Conv(channels, channels, k=(1, 5), p=(0, 2)),
             Conv(channels, channels, k=(1, 5), p=(0, 2))
         )
         # Frequency path (focus on mel-bins axis)
         self.freq_conv = nn.Sequential(
-            Conv(channels, channels, k=(5, 1), p=(2, 0)),  # Wide in freq, narrow in time
+            Conv(channels, channels, k=(5, 1), p=(2, 0)),
             Conv(channels, channels, k=(5, 1), p=(2, 0))
         )
         self.fusion = Conv(channels * 2, channels, k=1)
@@ -59,8 +59,53 @@ class BiPathBlock(nn.Module):
         return self.ca(fused) + x  # residual
 
 
+class AudioConformerBlock(nn.Module):
+    """2D-adapted Conformer Block for global context in Audio Spectrograms"""
+    def __init__(self, channels, num_heads=4, expansion=2):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(channels)
+        self.mhsa = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        
+        self.norm2 = nn.LayerNorm(channels)
+        # Depthwise Conv over spatial dimensions
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        )
+        
+        self.norm3 = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, channels * expansion),
+            nn.SiLU(inplace=True),
+            nn.Linear(channels * expansion, channels)
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 1. Multi-Head Self Attention (Global Context)
+        x_flat = x.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
+        nx = self.norm1(x_flat)
+        attn_out, _ = self.mhsa(nx, nx, nx)
+        x_flat = x_flat + attn_out
+        
+        # 2. Convolutional Module (Local Spatial Structure)
+        x_conv = x_flat.transpose(1, 2).view(B, C, H, W)  # [B, C, H, W]
+        nx_conv = self.norm2(x_flat).transpose(1, 2).view(B, C, H, W)
+        x_conv = x_conv + self.conv(nx_conv)
+        
+        # 3. Feed Forward Network
+        x_conv_flat = x_conv.view(B, C, -1).transpose(1, 2)
+        nx_ffn = self.norm3(x_conv_flat)
+        x_out_flat = x_conv_flat + self.ffn(nx_ffn)
+        
+        return x_out_flat.transpose(1, 2).view(B, C, H, W)
+
+
 class BiPathBackbone(nn.Module):
-    """Backbone with Bi-Path Fusion + Channel Attention"""
+    """Backbone with Bi-Path Fusion, Channel Attention, and Audio Conformer"""
     def __init__(self, base_channels=32, scales=[4, 8, 16]):
         super().__init__()
         self.entry = nn.Sequential(
@@ -74,7 +119,8 @@ class BiPathBackbone(nn.Module):
             stage = nn.Sequential(
                 Conv(channels, channels * 2, 3, stride=(1, 2)),  # down time again
                 *[BiPathBlock(channels * 2) for _ in range(3)],
-                BiPathBlock(channels * 2)
+                BiPathBlock(channels * 2),
+                AudioConformerBlock(channels * 2, num_heads=4)  # Injecting Global Context
             )
             self.stages.append(stage)
             channels *= 2
