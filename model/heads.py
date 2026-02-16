@@ -37,11 +37,6 @@ class VarifocalLoss(nn.Module):
         super().__init__()
 
     def forward(self, pred_score, gt_score, label, alpha=0.75, gamma=2.0):
-        """
-        pred_score: [bs, num_queries, num_classes]
-        gt_score:   [bs, num_queries] IoU-aware target scores
-        label:      [bs, num_queries] class labels (-1 for negative)
-        """
         pos_mask = label >= 0
         if pos_mask.sum() == 0:
             return torch.tensor(0.0, device=pred_score.device)
@@ -58,11 +53,18 @@ class VarifocalLoss(nn.Module):
         return loss.mean()
 
 
-class CIoULoss(nn.Module):
-    """Complete IoU Loss with distance, aspect ratio and center penalty"""
+class AudioIoULoss(nn.Module):
+    """Asymmetric IoU Loss specifically designed for Audio Spectrograms.
+    Heavily penalizes time axis errors, lightly penalizes frequency axis errors."""
+    def __init__(self, time_weight=2.0, freq_weight=0.5):
+        super().__init__()
+        self.time_weight = time_weight
+        self.freq_weight = freq_weight
+
     def forward(self, pred_boxes, target_boxes):
         """
-        pred_boxes, target_boxes: [N, 4] in format (x1,y1,x2,y2)
+        pred_boxes, target_boxes: [N, 4] in format (x1,y1,x2,y2) 
+        where x is time, y is frequency.
         """
         # Intersection
         x1 = torch.max(pred_boxes[:, 0], target_boxes[:, 0])
@@ -79,33 +81,29 @@ class CIoULoss(nn.Module):
         
         iou = inter / union
         
-        # Enclosure
+        # Enclosure box (smallest bounding box containing both)
         enclose_x1 = torch.min(pred_boxes[:, 0], target_boxes[:, 0])
         enclose_y1 = torch.min(pred_boxes[:, 1], target_boxes[:, 1])
         enclose_x2 = torch.max(pred_boxes[:, 2], target_boxes[:, 2])
         enclose_y2 = torch.max(pred_boxes[:, 3], target_boxes[:, 3])
-        enclose_w = enclose_x2 - enclose_x1
-        enclose_h = enclose_y2 - enclose_y1
-        enclose_diag = enclose_w.pow(2) + enclose_h.pow(2) + 1e-7
         
-        # Center distance
-        c_x = (pred_boxes[:, 0] + pred_boxes[:, 2]) / 2
-        c_y = (pred_boxes[:, 1] + pred_boxes[:, 3]) / 2
-        t_cx = (target_boxes[:, 0] + target_boxes[:, 2]) / 2
-        t_cy = (target_boxes[:, 1] + target_boxes[:, 3]) / 2
-        center_dist = (c_x - t_cx).pow(2) + (c_y - t_cy).pow(2)
+        enclose_w = (enclose_x2 - enclose_x1).clamp(min=1e-7)
+        enclose_h = (enclose_y2 - enclose_y1).clamp(min=1e-7)
         
-        # Aspect ratio consistency
-        v = 4 / (torch.pi**2) * (
-            torch.atan((target_boxes[:, 2] - target_boxes[:, 0]) / 
-                       (target_boxes[:, 3] - target_boxes[:, 1] + 1e-7)) -
-            torch.atan((pred_boxes[:, 2] - pred_boxes[:, 0]) / 
-                       (pred_boxes[:, 3] - pred_boxes[:, 1] + 1e-7))
-        ).pow(2)
+        # Center coordinates
+        c_x_p = (pred_boxes[:, 0] + pred_boxes[:, 2]) / 2
+        c_y_p = (pred_boxes[:, 1] + pred_boxes[:, 3]) / 2
+        c_x_t = (target_boxes[:, 0] + target_boxes[:, 2]) / 2
+        c_y_t = (target_boxes[:, 1] + target_boxes[:, 3]) / 2
         
-        alpha = v / ((1 - iou) + v + 1e-7)
+        # Asymmetric distance penalties
+        time_penalty = ((c_x_p - c_x_t) / enclose_w).pow(2)
+        freq_penalty = ((c_y_p - c_y_t) / enclose_h).pow(2)
         
-        return (1 - iou + (center_dist / enclose_diag) + (alpha * v)).mean()
+        # Combined asymmetric penalty
+        penalty = (self.time_weight * time_penalty) + (self.freq_weight * freq_penalty)
+        
+        return (1 - iou + penalty).mean()
 
 
 class AnchorFreeDetectionHead(nn.Module):
@@ -138,12 +136,6 @@ class AnchorFreeDetectionHead(nn.Module):
         self.dfl = DFL(reg_max)
 
     def forward(self, feats: List[torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        feats: list of multi-scale feature maps [P3, P4, P5]
-        Returns:
-            cls_scores: list of [bs, num_classes, h, w]
-            reg_preds:  list of [bs, 4*(reg_max+1), h, w]
-        """
         cls_scores = []
         reg_preds = []
         
@@ -165,7 +157,6 @@ class SegmentationHead(nn.Module):
         self.mask_coeff = nn.Conv2d(in_channels, num_classes, 1, bias=True)
 
     def forward(self, feats: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Using highest resolution feature (P3)
         high_res = feats[0]
         proto = self.proto(high_res).relu()
         coeffs = self.mask_coeff(high_res)
@@ -202,51 +193,77 @@ def decode_boxes(reg: torch.Tensor, stride: int, feat_shape: Tuple[int, int]) ->
     return boxes
 
 
+def batched_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute batched IoU between [B, N, 4] and [B, M, 4]
+    Returns: [B, N, M] tensor of IoUs
+    """
+    area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+    area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+    
+    lt = torch.max(boxes1[..., :, None, :2], boxes2[..., None, :, :2])
+    rb = torch.min(boxes1[..., :, None, 2:], boxes2[..., None, :, 2:])
+    
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    
+    union = area1[..., :, None] + area2[..., None, :] - inter
+    return inter / (union + 1e-7)
+
+
 def task_aligned_assigner(
     pred_boxes: torch.Tensor,
     pred_scores: torch.Tensor,
     gt_boxes: torch.Tensor,
     gt_labels: torch.Tensor,
+    mask_gt: torch.Tensor = None,
     iou_thres: float = 0.5
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    SimOTA-like task-aligned assigner
+    Fully batched SimOTA-like task-aligned assigner.
+    Args:
+        pred_boxes: [B, A, 4]
+        pred_scores: [B, A, C]
+        gt_boxes: [B, M, 4]
+        gt_labels: [B, M]
+        mask_gt: [B, M] boolean mask indicating valid GT boxes (to ignore padding)
     Returns:
-        assigned_gt_ids: [num_anchors] index of assigned gt or -1
-        assigned_scores: [num_anchors] IoU-aware scores for positives
-        pos_mask: [num_anchors] bool mask for positives
+        assigned_gt_ids: [B, A] index of assigned gt or -1
+        assigned_scores: [B, A] IoU-aware scores for positives
+        pos_mask: [B, A] bool mask for positives
     """
-    # Simplified version for batch_size=1; extend for full batch
-    # Compute IoU matrix [num_anchors, num_gt]
-    iou = box_iou(pred_boxes, gt_boxes)  # implement box_iou below
+    B, A, C = pred_scores.shape
+    M = gt_boxes.shape[1]
     
-    # Cost = - (score * iou)
-    scores = pred_scores.gather(1, gt_labels.unsqueeze(0).repeat(pred_scores.shape[0], 1))
-    cost = - (scores * iou)
-    
-    # Assign with min cost (Hungarian-like but approx)
-    assigned_ids = cost.argmin(dim=1)
-    
-    # Filter low IoU
-    max_iou = iou.max(dim=1)[0]
-    pos_mask = max_iou >= iou_thres
-    
-    assigned_scores = max_iou[pos_mask]
-    assigned_ids[~pos_mask] = -1
-    
-    return assigned_ids, assigned_scores, pos_mask
+    # Auto-infer mask if not provided (assume valid boxes have area > 0)
+    if mask_gt is None:
+        mask_gt = (gt_boxes.sum(dim=-1) > 0)
 
-
-def box_iou(boxes1, boxes2):
-    """Compute IoU between two sets of boxes [N,4] and [M,4]"""
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    # 1. Compute IoUs [B, A, M]
+    ious = batched_box_iou(pred_boxes, gt_boxes)
     
-    x1 = torch.max(boxes1[:, None, 0], boxes2[:, 0])
-    y1 = torch.max(boxes1[:, None, 1], boxes2[:, 1])
-    x2 = torch.min(boxes1[:, None, 2], boxes2[:, 2])
-    y2 = torch.min(boxes1[:, None, 3], boxes2[:, 3])
+    # 2. Gather class scores corresponding to GT labels
+    # Expand labels to index into pred_scores: [B, A, C] -> [B, A, M]
+    gt_labels_exp = gt_labels.unsqueeze(1).expand(B, A, M)
+    scores_for_gt = pred_scores.gather(2, gt_labels_exp)
     
-    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
-    union = area1[:, None] + area2 - inter
-    return inter / (union + 1e-7)
+    # 3. Compute Alignment Metric (Cost = score * iou)
+    align_metric = scores_for_gt * ious
+    
+    # Zero out invalid ground truths using the mask
+    align_metric = align_metric * mask_gt.unsqueeze(1).float()
+    
+    # 4. Assign each anchor to the GT with the maximum alignment metric
+    assigned_scores, assigned_gt_ids = align_metric.max(dim=-1)  # [B, A]
+    
+    # 5. Extract the corresponding IoUs for the assigned targets
+    assigned_ious = ious.gather(2, assigned_gt_ids.unsqueeze(-1)).squeeze(-1)  # [B, A]
+    
+    # 6. Create positive mask
+    pos_mask = (assigned_scores > 0) & (assigned_ious >= iou_thres)
+    
+    # 7. Nullify non-positive assignments
+    assigned_gt_ids[~pos_mask] = -1
+    assigned_scores[~pos_mask] = 0.0
+    
+    return assigned_gt_ids, assigned_scores, pos_mask
