@@ -1,7 +1,7 @@
 import argparse
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import wandb
@@ -10,7 +10,7 @@ import copy
 import numpy as np
 from config import YOHOConfig
 from model.yoho import YOHO
-from data.audio_dataset import AudioSEDDataset
+from data.audio_dataset import AudioSEDDataset, create_dataloader
 from data.desed_dataset import DESEDDataset
 from utils.metrics import event_based_f1, proper_psds
 
@@ -113,11 +113,11 @@ def main(args):
     if config.data.curriculum_enabled:
         weights = get_sample_weights(dataset)
         sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
-        loader = DataLoader(dataset, config.train.batch_size, sampler=sampler, num_workers=4)
+        loader = create_dataloader(dataset, config.train.batch_size, sampler=sampler, num_workers=4)
     else:
-        loader = DataLoader(dataset, config.train.batch_size, shuffle=True, num_workers=4)
+        loader = create_dataloader(dataset, config.train.batch_size, shuffle=True, num_workers=4)
         
-    val_loader = DataLoader(dataset, config.train.batch_size, shuffle=False, num_workers=4)
+    val_loader = create_dataloader(dataset, config.train.batch_size, shuffle=False, num_workers=4)
     
     model = YOHO(config.model).to(device)
     ema = ModelEMA(model, decay=config.train.ema_decay)
