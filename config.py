@@ -1,65 +1,128 @@
-from dataclasses import dataclass, field
-from typing import List, Optional
-import torch
+"""
+Evaluation metrics for SED: event-based F1 and PSDS.
+Uses psds_eval for PSDS computation.
+"""
 
-@dataclass
-class SpecConfig:
-    sample_rate: int = 44100
-    n_mels: int = 128
-    hop_length: int = 512
-    n_fft: int = 1024
-    f_max: int = 8000
-    normalized: bool = True
+import numpy as np
+import pandas as pd
+from psds_eval import PSDSEval
 
-@dataclass
-class AugmentConfig:
-    mixup_prob: float = 0.5
-    mixup_alpha: float = 1.5
-    time_mask_param: int = 30
-    freq_mask_param: int = 15
+MAX_DUR_SEC = 5.0
 
-@dataclass
-class ModelConfig:
-    input_channels: int = 1  
-    num_classes: int = 10  
-    base_channels: int = 32
-    scales: List[int] = field(default_factory=lambda: [4, 8, 16])
-    bifpn_layers: int = 2     # Number of BiFPN repeats
-    attention_heads: int = 4
-    memory_slots: int = 256
-    use_memory: bool = False  
-    seg_enabled: bool = False
-    reg_max: int = 16
+def event_based_f1(pred_events: dict, gt_events: dict, t_collar: float = 0.2, f_collar: float = 0.1) -> float:
+    """
+    Simple event-based F1-score with collar tolerance.
+    
+    Args:
+        pred_events: dict with 'boxes' (N,4), 'labels' (N,)
+        gt_events: dict with 'boxes' (M,4), 'labels' (M,)
+        t_collar: time tolerance in seconds
+        f_collar: frequency tolerance in Hz
+    """
+    pred_boxes = pred_events["boxes"].cpu().numpy()
+    pred_labels = pred_events["labels"].cpu().numpy()
+    gt_boxes = gt_events["boxes"].cpu().numpy()
+    gt_labels = gt_events["labels"].cpu().numpy()
 
-@dataclass
-class TrainConfig:
-    batch_size: int = 16
-    lr: float = 1e-3
-    epochs: int = 100
-    weight_decay: float = 1e-4
-    clip_grad: float = 5.0
-    amp: bool = True
-    ema_decay: float = 0.9999
-    patience: int = 10
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    wandb_project: Optional[str] = "yoho-audio"
+    tp = 0
+    used = np.zeros(len(gt_boxes), dtype=bool)
 
-@dataclass
-class DataConfig:
-    dataset: str = "esc50"  
-    root_dir: str = "./data"
-    augment_prob: float = 0.5
-    spec: SpecConfig = field(default_factory=SpecConfig)
-    aug: AugmentConfig = field(default_factory=AugmentConfig)
-    curriculum_enabled: bool = True
-    curriculum_start_epoch: int = 0
-    curriculum_ramp_epochs: int = 30  
-    complexity_metric: str = "num_events"  
+    for p_box, p_label in zip(pred_boxes, pred_labels):
+        for i, (g_box, g_label) in enumerate(zip(gt_boxes, gt_labels)):
+            if used[i]:
+                continue
+            t_overlap = min(p_box[2], g_box[2]) - max(p_box[0], g_box[0])
+            f_overlap = min(p_box[3], g_box[3]) - max(p_box[1], g_box[1])
+            if (t_overlap >= -t_collar and f_overlap >= -f_collar and p_label == g_label):
+                tp += 1
+                used[i] = True
+                break
 
-@dataclass
-class YOHOConfig:
-    model: ModelConfig = field(default_factory=ModelConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
-    data: DataConfig = field(default_factory=DataConfig)
+    fp = len(pred_boxes) - tp
+    fn = len(gt_boxes) - tp
 
-cfg = YOHOConfig()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return f1
+
+
+def proper_psds(
+    preds_list: list[dict],
+    gts_list: list[dict],
+    dtc_threshold: float = 0.5,
+    gtc_threshold: float = 0.5,
+    cttc_threshold: float = 0.3,
+    alpha_ct: float = 0.0,
+    alpha_st: float = 0.0
+) -> dict:
+    """
+    Compute PSDS using psds_eval library.
+    
+    Args:
+        preds_list: list of prediction dicts (each with 'boxes', 'labels')
+        gts_list: list of ground truth dicts (each with 'boxes', 'labels')
+        ... thresholds for PSDS scenarios
+    
+    Returns:
+        dict with PSDS scores for different scenarios
+    """
+    # Prepare dataframes in psds_eval format
+    pred_rows = []
+    gt_rows = []
+
+    for i, (pred, gt) in enumerate(zip(preds_list, gts_list)):
+        filename = f"file_{i:04d}"
+
+        # Predictions
+        pred_boxes = pred["boxes"].cpu().numpy()
+        pred_labels = pred["labels"].cpu().numpy()
+        for box, label in zip(pred_boxes, pred_labels):
+            pred_rows.append({
+                "filename": filename,
+                "onset": float(box[0]) * MAX_DUR_SEC,
+                "offset": float(box[2]) * MAX_DUR_SEC,
+                "event_label": str(label)  # convert to string
+            })
+
+        # Ground truth
+        gt_boxes = gt["boxes"].cpu().numpy()
+        gt_labels = gt["labels"].cpu().numpy()
+        for box, label in zip(gt_boxes, gt_labels):
+            gt_rows.append({
+                "filename": filename,
+                "onset": float(box[0]) * MAX_DUR_SEC,
+                "offset": float(box[2]) * MAX_DUR_SEC,
+                "event_label": str(label)
+            })
+
+    if not pred_rows or not gt_rows:
+        return {"psds_scenario1": 0.0, "psds_scenario2": 0.0}
+
+    pred_df = pd.DataFrame(pred_rows)
+    gt_df = pd.DataFrame(gt_rows)
+
+    # Get unique event labels
+    class_names = sorted(gt_df["event_label"].unique())
+
+    # Initialize evaluator
+    psds_eval = PSDSEval(
+        ground_truth=gt_df,
+        dtc_threshold=dtc_threshold,
+        gtc_threshold=gtc_threshold,
+        cttc_threshold=cttc_threshold
+    )
+
+    # Add operating point
+    psds_eval.add_operating_point(pred_df)
+
+    # Compute PSDS for different scenarios
+    psds_scenario1 = psds_eval.compute()
+    psds_scenario2 = psds_eval.compute(alpha_ct=alpha_ct, alpha_st=alpha_st)
+
+    return {
+        "psds_scenario1": psds_scenario1,
+        "psds_scenario2": psds_scenario2,
+        "class_names": class_names
+    }
