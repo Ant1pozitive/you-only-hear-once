@@ -120,6 +120,7 @@ def main(args):
     scaler = GradScaler(enabled=config.train.amp)
 
     best_f1 = 0.0
+    patience_counter = 0
     for epoch in range(1, config.train.epochs + 1):
         train_loss = train_epoch(model, ema, loader, optimizer, scaler, device, epoch, config)
         metrics = evaluate(ema.ema, val_loader, device, config)
@@ -129,8 +130,14 @@ def main(args):
 
         if metrics["f1"] > best_f1:
             best_f1 = metrics["f1"]
+            patience_counter = 0
             torch.save(ema.ema.state_dict(), "checkpoints/best_yoho_ema.pth")
             print(f"New best F1 (EMA): {best_f1:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= config.train.patience:
+                print(f"Early stopping at epoch {epoch} (no improvement for {config.train.patience} epochs)")
+                break
 
     print("Training finished.")
 
