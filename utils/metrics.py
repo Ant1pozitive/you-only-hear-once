@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from psds_eval import PSDSEval
 
+MAX_DUR_SEC = 5.0
+
 def event_based_f1(pred_events: dict, gt_events: dict, t_collar: float = 0.2, f_collar: float = 0.1) -> float:
     """
     Simple event-based F1-score with collar tolerance.
@@ -79,8 +81,8 @@ def proper_psds(
         for box, label in zip(pred_boxes, pred_labels):
             pred_rows.append({
                 "filename": filename,
-                "onset": float(box[0]),
-                "offset": float(box[2]),
+                "onset": float(box[0]) * MAX_DUR_SEC,
+                "offset": float(box[2]) * MAX_DUR_SEC,
                 "event_label": str(label)  # convert to string
             })
 
@@ -90,8 +92,8 @@ def proper_psds(
         for box, label in zip(gt_boxes, gt_labels):
             gt_rows.append({
                 "filename": filename,
-                "onset": float(box[0]),
-                "offset": float(box[2]),
+                "onset": float(box[0]) * MAX_DUR_SEC,
+                "offset": float(box[2]) * MAX_DUR_SEC,
                 "event_label": str(label)
             })
 
