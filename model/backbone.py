@@ -50,6 +50,7 @@ class BiPathBlock(nn.Module):
         )
         self.fusion = Conv(channels * 2, channels, k=1)
         self.ca = ChannelAttention(channels)
+        self.strides = [4, 8, 16]
 
     def forward(self, x):
         temp = self.temp_conv(x)
