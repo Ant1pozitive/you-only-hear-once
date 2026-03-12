@@ -54,7 +54,6 @@ class AudioIoULoss(nn.Module):
         area_t = (target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1])
         union = area_p + area_t - inter + 1e-7
         iou = inter / union
-        # asymmetric penalty
         enclose_w = (torch.max(pred_boxes[:, 2], target_boxes[:, 2]) - torch.min(pred_boxes[:, 0], target_boxes[:, 0])).clamp(min=1e-7)
         enclose_h = (torch.max(pred_boxes[:, 3], target_boxes[:, 3]) - torch.min(pred_boxes[:, 1], target_boxes[:, 1])).clamp(min=1e-7)
         time_penalty = ((pred_boxes[:, 0] + pred_boxes[:, 2] - target_boxes[:, 0] - target_boxes[:, 2]) / (2 * enclose_w)).pow(2)
@@ -85,10 +84,13 @@ def decode_boxes(reg: torch.Tensor, stride: int, feat_shape: Tuple[int, int]) ->
     dfl = DFL(16)
     dist = dfl(reg).permute(0, 2, 1)  # [B, num_q, 4]
     B, num_q, _ = dist.shape
-    h, w = int(num_q ** 0.5), int(num_q ** 0.5)  # approximate for grid
-    grid_y, grid_x = torch.meshgrid(torch.arange(h, device=reg.device), torch.arange(w, device=reg.device), indexing='ij')
-    grid = torch.stack((grid_x, grid_y), dim=-1).float().view(1, -1, 2).expand(B, -1, 2)
-    center = (grid + 0.5) * stride
+    feat_h = feat_shape[0]
+    feat_w = feat_shape[1] // stride
+    grid_y = torch.arange(feat_h, device=reg.device, dtype=torch.float32)
+    grid_x = torch.arange(feat_w, device=reg.device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+    grid = torch.stack((grid_x, grid_y), dim=-1).view(1, -1, 2).expand(B, -1, 2)
+    center = (grid + 0.5) * torch.tensor([stride, 1.0], device=reg.device)
     boxes = torch.cat((center - dist[..., :2], center + dist[..., 2:]), dim=-1)
     # normalize to [0,1]
     boxes[..., [0, 2]] /= feat_shape[1]
