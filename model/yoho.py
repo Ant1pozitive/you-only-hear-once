@@ -12,16 +12,44 @@ from .heads import (
     box_iou
 )
 
+def simple_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float = 0.45) -> torch.Tensor:
+    """Simple NMS without torchvision (for stability)"""
+    if len(boxes) == 0:
+        return torch.empty(0, dtype=torch.long, device=boxes.device)
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i.item())
+        if order.numel() == 1:
+            break
+        xx1 = torch.max(x1[i], x1[order[1:]])
+        yy1 = torch.max(y1[i], y1[order[1:]])
+        xx2 = torch.min(x2[i], x2[order[1:]])
+        yy2 = torch.min(y2[i], y2[order[1:]])
+        w = (xx2 - xx1).clamp(min=0)
+        h = (yy2 - yy1).clamp(min=0)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-7)
+        order = order[1:][iou <= iou_thres]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
 class YOHO(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.num_classes = cfg.model.num_classes
         self.max_dur_sec = cfg.data.max_dur_sec
+        self.n_mels = cfg.data.spec.n_mels
 
         self.spec_transform = T.MelSpectrogram(
             sample_rate=cfg.data.spec.sample_rate,
-            n_mels=cfg.data.spec.n_mels,
+            n_mels=self.n_mels,
             hop_length=cfg.data.spec.hop_length,
             n_fft=cfg.data.spec.n_fft,
             f_max=cfg.data.spec.f_max,
@@ -40,10 +68,11 @@ class YOHO(nn.Module):
         in_ch = cfg.model.base_channels * 4
         self.det_head = AnchorFreeDetectionHead(in_channels=in_ch, num_classes=self.num_classes, reg_max=cfg.model.reg_max)
 
-        self.strides = [4, 8, 16]  # matches backbone downsampling
+        self.strides = [4, 8, 16]
         self.vfl = VarifocalLoss()
         self.iou_loss = AudioIoULoss(time_weight=2.0, freq_weight=0.5)
         self.conf_thres = 0.25
+        self.iou_thres = 0.45
 
     def forward(self, audio: torch.Tensor, targets: Dict = None) -> Dict:
         spec = self.spec_transform(audio)
@@ -68,7 +97,7 @@ class YOHO(nn.Module):
         all_pred_boxes = []
         for i in range(len(preds['cls'])):
             cls = preds['cls'][i].permute(0, 2, 3, 1).reshape(B, -1, self.num_classes)
-            reg = preds['reg'][i].flatten(2)  # flatten for DFL
+            reg = preds['reg'][i].flatten(2)
             boxes = decode_boxes(reg, self.strides[i], feat_shape)
             all_pred_scores.append(cls)
             all_pred_boxes.append(boxes)
@@ -108,7 +137,7 @@ class YOHO(nn.Module):
         return {"loss_cls": loss_cls, "loss_box": loss_box, "total_loss": total_loss, "num_pos": num_pos}
 
     @torch.inference_mode()
-    def infer(self, audio: torch.Tensor, conf_thres: float = 0.25) -> List[Dict]:
+    def infer(self, audio: torch.Tensor, conf_thres: float = 0.25, iou_thres: float = 0.45) -> List[Dict]:
         """per-sample + normalized -> seconds"""
         spec = self.spec_transform(audio).unsqueeze(1)
         feat_shape = (spec.shape[2], spec.shape[3])
@@ -134,7 +163,13 @@ class YOHO(nn.Module):
             scores = torch.cat(sample_scores, 0) if sample_scores else torch.empty(0, device=cls_scores[0].device)
             labels = torch.cat(sample_labels, 0) if sample_labels else torch.empty(0, dtype=torch.long, device=cls_scores[0].device)
 
-            # norm -> seconds
+            # NMS
+            if len(boxes) > 0:
+                keep = simple_nms(boxes, scores, iou_thres)
+                boxes = boxes[keep]
+                scores = scores[keep]
+                labels = labels[keep]
+
             boxes[:, [0, 2]] *= self.max_dur_sec
             all_sample_preds.append({"boxes": boxes, "scores": scores, "labels": labels})
         return all_sample_preds
