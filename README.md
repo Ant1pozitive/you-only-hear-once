@@ -13,7 +13,7 @@ It combines efficient CNN-based feature extraction, long-range context via Confo
 - BiPath Conformer Backbone: dual-path (time + frequency) processing with Audio Conformer blocks
 - BiFPN (Bi-directional Feature Pyramid Network) with learnable weighted fusion
 - Anchor-free detection head using Distribution Focal Loss (DFL) + Varifocal Loss
-- Asymmetric Audio IoU Loss — strong penalty on temporal errors, softer on frequency bounds
+- Asymmetric Audio IoU Loss - strong penalty on temporal errors, softer on frequency bounds
 - Polyphonic MixUp on waveform level with correct bounding box mixing
 - Model EMA (Exponential Moving Average) for better generalization
 - SpecAugment (frequency & time masking) applied during training
@@ -80,7 +80,7 @@ python train.py --batch-size 24 --lr 5e-4 --epochs 150
 
 1. Train or download a checkpoint (`checkpoints/best_yoho_ema.pth`)
 2. Open `demo.ipynb`
-3. Run all cells — includes synthetic audio generation + visualization
+3. Run all cells - includes synthetic audio generation + visualization
 
 ## 📂 Project Structure
 
